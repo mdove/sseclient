@@ -13,6 +13,7 @@ import warnings
 import six
 
 import requests
+import httpx
 
 __version__ = '0.0.26'
 
@@ -22,11 +23,12 @@ end_of_field = re.compile(r'\r\n\r\n|\r\r|\n\n')
 
 
 class SSEClient(object):
-    def __init__(self, url, last_id=None, retry=3000, session=None, chunk_size=1024, **kwargs):
+    def __init__(self, url, last_id=None, retry=3000, session=None, chunk_size=1024, use_httpx=True, **kwargs):
         self.url = url
         self.last_id = last_id
         self.retry = retry
         self.chunk_size = chunk_size
+        self.use_httpx = use_httpx
 
         # Optional support for passing in a requests.Session()
         self.session = session
@@ -53,14 +55,33 @@ class SSEClient(object):
 
         # Use session if set.  Otherwise fall back to requests module.
         requester = self.session or requests
-        self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
-        self.resp_iterator = self.iter_content()
-        self.decoder = codecs.getincrementaldecoder(
-            self.resp.encoding)(errors='replace')
+        if self.use_httpx:
+            self.resp = None
+            self.resp_iterator = self.iter_content_httpx()
+        else:
+            self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
+            self.resp_iterator = self.iter_content()
+
+        if hasattr(self.resp, 'encoding'):
+            self.decoder = codecs.getincrementaldecoder(self.resp.encoding)(
+                errors='replace'
+            )
+        else:
+            self.decoder = codecs.getincrementaldecoder('ISO-8859-1')(errors='replace')
 
         # TODO: Ensure we're handling redirects.  Might also stick the 'origin'
         # attribute on Events like the Javascript spec requires.
-        self.resp.raise_for_status()
+        if not self.use_httpx:
+            self.resp.raise_for_status()
+
+    # Iterator for HTTPX stream...
+    def iter_content_httpx(self):
+        def generate_httpx():
+            with self.session.stream("GET", self.url, **self.requests_kwargs) as r:
+                for chunk in r.iter_raw():
+                    yield chunk
+
+        return generate_httpx()
 
     def iter_content(self):
         def generate():
@@ -92,10 +113,20 @@ class SSEClient(object):
                 next_chunk = next(self.resp_iterator)
                 if not next_chunk:
                     raise EOFError()
+                # Firefox workaround, strip these "nulls" out of the stream
+                if next_chunk[0:3] == b':\n\n':
+                    next_chunk = next_chunk[3:]
                 self.buf += self.decoder.decode(next_chunk)
 
-            except (StopIteration, requests.RequestException, EOFError, six.moves.http_client.IncompleteRead) as e:
-                print(e)
+            except (
+                StopIteration,
+                requests.RequestException,
+                EOFError,
+                six.moves.http_client.IncompleteRead,
+                httpx.StreamConsumed,
+            ) as e:
+                if str(e) != "":
+                    print(e)
                 time.sleep(self.retry / 1000.0)
                 self._connect()
 
